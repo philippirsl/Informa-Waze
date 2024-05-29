@@ -1,0 +1,10 @@
+{
+    "areaBounds": {
+      "left": -26.8897,
+      "right": -26.2487,
+      "top": -53.6327,
+      "bottom": -48.6541
+    },
+    "requestUrl": "https://www.waze.com/row-rtserver/web/TGeoRSS?tk=community&format=JSON",
+    "broadcastFeedUrl": "https://www.waze.com/row-rtserver/broadcast/BroadcastRSS?buid=22c8ece8ae5b984902e7d1c69f5db4bf&format=JSON"
+  }
