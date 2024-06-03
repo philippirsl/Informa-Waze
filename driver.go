@@ -31,7 +31,7 @@ var (
 			"bottom": -27.800,
 		},
 		requestURL:       "https://www.waze.com/row-rtserver/web/TGeoRSS?tk=community&format=JSON",
-		broadcastFeedURL: "https://www.waze.com/row-rtserver/broadcast/BroadcastRSS?buid=22c8ece8ae5b984902e7d1c69f5db4bf&format=JSON",
+		broadcastFeedURL: "https://www.waze.com/row-rtserver/broadcast/BroadcastRSS?buid=xxxxxxxxxxxxxxxxxxxxxxx&format=JSON",
 	}
 
 	wg sync.WaitGroup
