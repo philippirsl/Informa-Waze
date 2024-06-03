@@ -1,7 +1,8 @@
+//go:generate encoding=UTF-8
+
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,16 +11,57 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/patrickmn/go-cache"
 )
 
-var (
-	channelID = os.Getenv("CHANNEL_ID")
+type Filters struct {
+	ChitChat bool `json:"chitChat"`
+	Police   bool `json:"police"`
+	Jam      bool `json:"jam"`
+	Accident bool `json:"accident"`
+	Unknown  bool `json:"unknown"`
+}
 
-	db               = NewDatabase("db.json")
-	processedAlerts  = db.GetProcessedAlerts()
-	maxWazersOnline  = db.GetMaxWazersOnline()
+func loadFilters(filename string) *Filters {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Printf("Erro ao abrir arquivo JSON de filtros: %v", err)
+		return &Filters{}
+	}
+	defer file.Close()
+
+	var filters Filters
+	if err := json.NewDecoder(file).Decode(&filters); err != nil {
+		log.Printf("Erro ao abrir o arquivo JSON de filtros: %v", err)
+		return &Filters{}
+	}
+
+	return &filters
+}
+
+func saveFilters(filename string, filters *Filters) {
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Printf("Erro ao criar arquivo JSON de filtros: %v", err)
+		return
+	}
+	defer file.Close()
+
+	if err := json.NewEncoder(file).Encode(filters); err != nil {
+		log.Printf("Erro ao codificar arquivo JSON de filtros: %v", err)
+		return
+	}
+}
+
+var (
 	telegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	telegramChatID   = os.Getenv("TELEGRAM_CHAT_ID")
+
+	db              = NewDatabase("db.json")
+	processedAlerts = db.GetProcessedAlerts()
+	maxWazersOnline = db.GetMaxWazersOnline()
+	c               *cache.Cache
 
 	options = struct {
 		areaBounds       map[string]float64
@@ -27,25 +69,232 @@ var (
 		broadcastFeedURL string
 	}{
 		areaBounds: map[string]float64{
-			"left":   -26.8897,
-			"right":  -26.2487,
-			"top":    -53.6327,
-			"bottom": -48.6541,
+			"left":   -52.2100,
+			"right":  -48.5400,
+			"top":    -26.5000,
+			"bottom": -27.5000,
 		},
 		requestURL:       "https://www.waze.com/row-rtserver/web/TGeoRSS?tk=community&format=JSON",
 		broadcastFeedURL: "https://www.waze.com/row-rtserver/broadcast/BroadcastRSS?buid=22c8ece8ae5b984902e7d1c69f5db4bf&format=JSON",
 	}
 
-	wg sync.WaitGroup
+	alerts       []map[string]interface{}
+	alertsLock   sync.Mutex
+	alertsCh     = make(chan map[string]interface{}, 10)
+	clients      = make(map[chan struct{}]struct{})
+	clientsLock  sync.Mutex
+	wg           sync.WaitGroup
+	shutdownOnce sync.Once
+	filters      *Filters
+	filtersLock  sync.Mutex
 )
 
 func main() {
+	c = cache.New(5*time.Minute, 10*time.Minute)
+	filters = loadFilters("filters.json")
 	wg.Add(1)
+	go startWebServer()
 	go scheduleJob("*/30 * * * * *", getUpdates)
 	go scheduleJob("*/20 * * * * *", countWazers)
 	go scheduleJob("0 * * * *", sendWazersReport)
 
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(alertsCh)
+	}()
+
+	for alert := range alertsCh {
+		alertsLock.Lock()
+		alerts = append(alerts, alert)
+		alertsLock.Unlock()
+
+		clientsLock.Lock()
+		for client := range clients {
+			client <- struct{}{}
+		}
+		clientsLock.Unlock()
+	}
+}
+
+func startWebServer() {
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/alerts", handleAlerts)
+	http.HandleFunc("/events", handleEvents)
+	http.HandleFunc("/filters", handleFilters)
+	http.HandleFunc("/updateFilters", handleUpdateFilters)
+	log.Fatal(http.ListenAndServe(":9091", nil))
+}
+
+func handleUpdateFilters(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var newFilters Filters
+	if err := json.NewDecoder(r.Body).Decode(&newFilters); err != nil {
+		http.Error(w, "Erro ao decodificar filtros", http.StatusBadRequest)
+		return
+	}
+
+	filtersLock.Lock()
+	filters = &newFilters
+	saveFilters("filters.json", filters)
+	filtersLock.Unlock()
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, "Bem-vindo ao servidor de alertas do Waze\n\n")
+	fmt.Fprintf(w, "Para ver os alertas, acesse /alerts\n")
+	fmt.Fprintf(w, "Para receber os alertas em tempo real, acesse /events\n")
+	fmt.Fprintf(w, "Para configurar os filtros, acesse /filters\n")
+}
+
+func handleAlerts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	alertsLock.Lock()
+	defer alertsLock.Unlock()
+	json.NewEncoder(w).Encode(alerts)
+}
+
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	notify := r.Context().Done()
+	client := make(chan struct{}, 1)
+
+	clientsLock.Lock()
+	clients[client] = struct{}{}
+	clientsLock.Unlock()
+
+	defer func() {
+		clientsLock.Lock()
+		delete(clients, client)
+		clientsLock.Unlock()
+		close(client)
+	}()
+
+	for {
+		select {
+		case <-notify:
+			logger("Cliente desconectado")
+			return
+		case <-client:
+			logger("Enviando eventos para o cliente")
+			alertsLock.Lock()
+			for _, alert := range alerts {
+				eventType := alert["type"].(string)
+				var message string
+
+				switch eventType {
+				case "CHIT_CHAT":
+					if filters.ChitChat {
+						message = handleChitChat(alert)
+					}
+				case "POLICE", "POLICEMAN":
+					if filters.Police {
+						message = handlePoliceAlert(alert)
+					}
+				case "JAM":
+					if filters.Jam {
+						message = handleJamAlert(alert)
+					}
+				case "ACCIDENT":
+					if filters.Accident {
+						message = handleAccidentAlert(alert)
+					}
+				default:
+					if filters.Unknown {
+						message = handleUnknownAlert(alert)
+					}
+				}
+
+				if message != "" {
+					fmt.Fprintf(w, "data: %s\n\n", message)
+					w.(http.Flusher).Flush()
+					logger("Evento enviado")
+				}
+			}
+			alertsLock.Unlock()
+		}
+	}
+}
+
+func handleFilters(w http.ResponseWriter, r *http.Request) {
+	html := `
+	<!DOCTYPE html>
+	<html>
+	<head>
+		<title>Configurar Filtros</title>
+	</head>
+	<body>
+		<h1>Configurar Filtros</h1>
+		<form id="filterForm">
+			<label><input type="checkbox" name="chit_chat"> Comnetário</label><br>
+			<label><input type="checkbox" name="police"> Polícia</label><br>
+			<label><input type="checkbox" name="jam"> Congestionamento</label><br>
+			<label><input type="checkbox" name="accident"> Acidente</label><br>
+			<label><input type="checkbox" name="unknown"> Outros</label><br>
+			<button type="submit">Salvar</button>
+		</form>
+		<script>
+			document.getElementById('filterForm').addEventListener('submit', function(event) {
+				event.preventDefault();
+				const formData = new FormData(this);
+				const filters = {};
+				for (const [name, value] of formData.entries()) {
+					filters[name] = value === 'on';
+				}
+				fetch('/updateFilters', {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify(filters),
+				}).then(() => {
+					alert('Filtros atualizados com sucesso');
+				}).catch((error) => {
+					alert('Erro ao atualizar filtros');
+					console.error(error);
+				});
+			});
+		</script>
+	</body>
+	</html>
+	`
+	fmt.Fprintf(w, html)
+}
+
+func handleChitChat(alert map[string]interface{}) string {
+	reportBy := alert["reportBy"].(string)
+	location := alert["location"].(string)
+
+	return fmt.Sprintf("[%s] 📢 %s deixou um comentário no mapa 💭\nAnálise 🗺️: %s", time.Now().Format("15:04:05"), reportBy, location)
+}
+
+func handlePoliceAlert(alert map[string]interface{}) string {
+	info := formatAlertData(alert)
+	return fmt.Sprintf("[%s] 📢 Polícia &#128660;\n```%s```", time.Now().Format("15:04:05"), info)
+}
+
+func handleJamAlert(alert map[string]interface{}) string {
+	info := formatAlertData(alert)
+	return fmt.Sprintf("[%s] 📢 Congestionamento 🚗🚕🚙\n```%s```", time.Now().Format("15:04:05"), info)
+}
+
+func handleAccidentAlert(alert map[string]interface{}) string {
+	info := formatAlertData(alert)
+	return fmt.Sprintf("[%s] 📢 Acidente 🚙💥🚕\n```%s```", time.Now().Format("15:04:05"), info)
+}
+
+func handleUnknownAlert(alert map[string]interface{}) string {
+	info := formatAlertData(alert)
+	return fmt.Sprintf("[%s] 🤖 Tipo de notificação desconhecida\n```%s```", time.Now().Format("15:04:05"), info)
 }
 
 func scheduleJob(cron string, job func()) {
@@ -64,100 +313,59 @@ func scheduleJob(cron string, job func()) {
 }
 
 func getUpdates() {
-	logger("recebendo atualizações")
+	logger("getting updates")
+
+	// Verifica se os dados estão no cache
+	if data, found := c.Get("wazeData"); found {
+		processAlerts(data.([]interface{}))
+		return
+	}
 
 	url := addBoundsToURL(options.areaBounds, options.requestURL)
 
 	resp, err := http.Get(url)
 	if err != nil {
-		logger("ERRO: não foi possível receber atualizações")
+		logger("ERROR: can't get updates")
 		return
 	}
 	defer resp.Body.Close()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		logger("ERRO: não foi possível receber respostas")
+		logger("ERROR: can't decode response")
 		return
 	}
 
-	logger(fmt.Sprintf("Dados recebidos: %v", data))
-	processData(data)
-}
-
-func processData(data map[string]interface{}) {
-	if alertsData, ok := data["alerts"]; ok {
-		if alerts, ok := alertsData.([]interface{}); ok {
-			processAlerts(alerts)
-			return
-		}
-	} else {
-		logger("Nenhum alerta recebido")
+	if _, ok := data["alerts"]; !ok {
+		logger("ERROR: 'alerts' key not found in data")
+		return
 	}
+
+	// Adiciona os dados ao cache
+	c.Set("wazeData", data["alerts"].([]interface{}), cache.DefaultExpiration)
+
+	processAlerts(data["alerts"].([]interface{}))
 }
 
 func processAlerts(alerts []interface{}) {
 	logger("processando alertas")
 
 	for _, alert := range alerts {
-		alertID := alert.(map[string]interface{})["uuid"].(string)
+		alertData := alert.(map[string]interface{})
+		alertID := alertData["uuid"].(string)
 		if !processedAlerts.Has(alertID) {
-			go handleAlert(alert)
+			alertsCh <- alertData
 			processedAlerts.Add(alertID)
 		}
 	}
 }
 
-func handleAlert(alert interface{}) {
-	alertData := alert.(map[string]interface{})
-	alertType := alertData["type"].(string)
-
-	switch alertType {
-	case "CHIT_CHAT":
-		handleChitChat(alertData)
-	case "POLICE", "POLICEMAN":
-		handlePoliceAlert(alertData)
-	case "JAM":
-		handleJamAlert(alertData)
-	case "ACCIDENT":
-		handleAccidentAlert(alertData)
-	default:
-		handleUnknownAlert(alertData)
-	}
-}
-
-func handleChitChat(alert map[string]interface{}) {
-	reportBy := alert["reportBy"].(string)
-	location := alert["location"].(string)
-
-	message := fmt.Sprintf("📢 %s deixou um comentário no mapa 💭\nAnálise 🗺️: %s", reportBy, location)
-	sendMessage(message)
-}
-
-func handlePoliceAlert(alert map[string]interface{}) {
-	sendMessage("📢 Polícia 🚓")
-}
-
-func handleJamAlert(alert map[string]interface{}) {
-	sendMessage("📢 Congestionamento 🚗🚕🚙")
-}
-
-func handleAccidentAlert(alert map[string]interface{}) {
-	sendMessage("📢 Acidente 🚙💥🚕")
-}
-
-func handleUnknownAlert(alert map[string]interface{}) {
-	info := formatAlertData(alert)
-	message := fmt.Sprintf("🤖 Tipo de notificação desconhecida\n```%s```", info)
-	sendMessage(message)
-}
-
 func countWazers() {
-	logger("procurando motoristas")
+	logger("contando motoristas")
 
 	resp, err := http.Get(options.broadcastFeedURL)
 	if err != nil {
-		logger("ERRO: não foi possível procurar motoristas")
+		logger("ERROR: can't count wazers")
 		return
 	}
 	defer resp.Body.Close()
@@ -201,30 +409,8 @@ func addBoundsToURL(bounds map[string]float64, sourceURL string) string {
 	return sb.String()
 }
 
-func sendMessage(text string) error {
-	message := map[string]string{
-		"chat_id":    telegramChatID,
-		"text":       text,
-		"parse_mode": "HTML",
-	}
-
-	messageBytes, err := json.Marshal(message)
-	if err != nil {
-		return err
-	}
-
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramBotToken)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(messageBytes))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Telegram API retornou status: %s", resp.Status)
-	}
-
-	return nil
+func sendMessage(text string) {
+	fmt.Println(text)
 }
 
 func logger(msg string) {
@@ -233,12 +419,13 @@ func logger(msg string) {
 }
 
 func formatAlertData(alert map[string]interface{}) string {
-	// Format the alert data as JSON
-	alertJSON, err := json.MarshalIndent(alert, "", "  ")
-	if err != nil {
-		return fmt.Sprintf("Error formatting alert data: %s", err)
+	var sb strings.Builder
+
+	for key, val := range alert {
+		sb.WriteString(fmt.Sprintf("%s: %v\n", key, val))
 	}
-	return string(alertJSON)
+
+	return sb.String()
 }
 
 type Database struct {
